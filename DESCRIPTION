@@ -1,0 +1,44 @@
+Package: MRStdLCRT
+Type: Package
+Title: Model-Robust Standardization for Stepped-wedge Cluster-Randomized Trials
+Version: 0.1.0
+Authors@R: c(
+    person("Xi", "Fang", email = "x.fang@yale.edu", role = c("aut", "cre"))
+  )
+Description: Estimation and leave-one-cluster-out jackknife standard errors for
+    four crossover estimands—horizontal individual ATE (h-iATE), horizontal cluster ATE (h-cATE),
+    vertical individual ATE (v-iATE), and vertical cluster-period ATE (v-cATE)—via
+    unadjusted and augmented (model-robust standardization) approaches.
+    Supports continuous outcomes via linear mixed models and binary outcomes via GEE or GLMM.
+    Optionally excludes the first and last periods when aggregating estimands (stepped-wedge style).
+License: MIT + file LICENSE
+Encoding: UTF-8
+LazyData: true
+Depends:
+    R (>= 4.0)
+Imports:
+    dplyr (>= 1.1.0),
+    tidyr (>= 1.3.0),
+    rlang (>= 1.1.0),
+    gee,
+    lme4 (>= 1.1-30),
+    clubSandwich (>= 0.6.0),
+    geesmv,
+    matrixcalc,
+    ggplot2 (>= 3.4.0),
+    stats,
+    methods,
+    utils,
+    tidyselect
+Suggests:
+    purrr,
+    testthat (>= 3.0.0),
+    roxygen2,
+    knitr,
+    rmarkdown,
+    usethis
+VignetteBuilder: knitr
+Config/testthat/edition: 3
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.1
+

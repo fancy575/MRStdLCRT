@@ -1,0 +1,875 @@
+library(dplyr)
+library(lme4)
+library(geepack)
+library(caret)
+library(gee)
+library(purrr)
+library(rlang)
+library(tidyr)
+library(clubSandwich)
+library(geesmv)
+library(matrixcalc)
+
+
+GEE.var.kc <-
+  function(formula,id,family=gaussian,data,corstr="independence"){
+    #########################################################################
+    # Arguments:
+    # formula  specify the model of interest
+    # family   "gaussian", "binomial" or "poisson"
+    # data     data frame
+    # corstr   Working correlation structure: "independence", "AR-M", "exchangeable", "unstructured".
+    # value:   GEE returns a list containing the following elements
+    #          cov.beta     estimate of robust variance for \hat{\beta}
+    #          cov.var      estimate of the variance-covariance matrix for robust variance.
+    #########################################################################
+    # Delete the records with missing data in predictors or outcomes;
+    if (is.null(data$id)){
+      index <- which(names(data)==id)
+      data$id <- data[,index]}
+    
+    ### na.action: only na.omit is used for gee;
+    init <- model.frame(formula, data)
+    init$num <- 1:length(init[,1])
+    if(any(is.na(init))){
+      index <- na.omit(init)$num
+      data <- data[index,]
+      ### Get the design matrix;
+      m <- model.frame(formula, data)
+      mt <- attr(m, "terms") 
+      data$response <- model.response(m, "numeric")
+      mat <- as.data.frame(model.matrix(formula, m))
+    }else{
+      ### Get the design matrix;
+      m <- model.frame(formula, data)
+      mt <- attr(m, "terms") 
+      data$response <- model.response(m, "numeric")
+      mat <- as.data.frame(model.matrix(formula, m))
+    }
+    
+    ### Fit the GEE model to get the estimate of parameters \hat{\beta};
+    gee.fit <- gee(formula,data=data,id=id,family=family,corstr=corstr)
+    beta_est <- gee.fit$coefficient
+    alpha <- gee.fit$working.correlation[1,2]
+    len <- length(beta_est)
+    len_vec <- len^2
+    
+    ### Estimate the robust variance for \hat{\beta}
+    data$id <- gee.fit$id
+    cluster<-cluster.size(data$id)
+    ncluster<-max(cluster$n)
+    size<-cluster$m
+    mat$subj <- rep(unique(data$id), cluster$n)
+    if(is.character(corstr)){
+      var <- switch(corstr,
+                    "independence"=cormax.ind(ncluster),
+                    "exchangeable"=cormax.exch(ncluster, alpha),
+                    "AR-M"=cormax.ar1(ncluster, alpha),
+                    "unstructured"=summary(gee.fit)$working.correlation,)
+    }else{
+      print(corstr)
+      stop("'working correlation structure' not recognized")
+    }   
+    if(is.character(family)){
+      family <- switch(family,
+                       "gaussian"="gaussian",
+                       "binomial"="binomial",
+                       "poisson"="poisson")
+    }else{ 
+      if(is.function(family)){
+        family <- family()[[1]]
+      }else{
+        print(family)
+        stop("'family' not recognized")
+      }    
+    }
+    
+    cov.beta<-unstr<-matrix(0,nrow=len,ncol=len)
+    step11<-matrix(0, nrow=len, ncol=len)
+    for (i in 1:size){
+      y<-as.matrix(data$response[data$id==unique(data$id)[i]])
+      covariate<-as.matrix(subset(mat[,-length(mat[1,])], mat$subj==unique(data$id)[i]))
+      var_i=var[1:cluster$n[i],1:cluster$n[i]]
+      if (family=="gaussian"){ 
+        xx<-t(covariate)%*%solve(var_i)%*%covariate
+        step11<-step11+xx  
+      }else if (family=="poisson") {
+        D<-mat.prod(covariate, exp(covariate%*%beta_est))
+        Vi <- diag(sqrt(c(exp(covariate%*%beta_est))),cluster$n[i])%*%var_i%*%diag(sqrt(c(exp(covariate%*%beta_est))),cluster$n[i])
+        xx<-t(D)%*%solve(Vi)%*%D
+        step11<-step11+xx
+      }else if (family=="binomial"){
+        D<-mat.prod(covariate, exp(covariate%*%beta_est)/((1+exp(covariate%*%beta_est))^2))
+        Vi <- diag(sqrt(c(exp(covariate%*%beta_est)/(1+exp(covariate%*%beta_est))^2)),cluster$n[i])%*%var_i%*%diag(sqrt(c(exp(covariate%*%beta_est)/(1+exp(covariate%*%beta_est))^2)),cluster$n[i])
+        xx<-t(D)%*%solve(Vi)%*%D
+        step11<-step11+xx 
+      }
+    }
+    step12<-matrix(0,nrow=len,ncol=len)
+    step13<-matrix(0,nrow=len_vec,ncol=1)
+    step14<-matrix(0,nrow=len_vec,ncol=len_vec)
+    p<-matrix(0,nrow=len_vec,ncol=size)
+    for (i in 1:size){
+      y<-as.matrix(data$response[data$id==unique(data$id)[i]])
+      covariate<-as.matrix(subset(mat[,-length(mat[1,])], mat$subj==unique(data$id)[i]))
+      var_i=var[1:cluster$n[i],1:cluster$n[i]]
+      if (family=="gaussian"){ 
+        xy<-t(covariate)%*%solve(var_i)%*%mat.sqrt.inv(cormax.ind(cluster$n[i])-covariate%*%solve(step11)%*%t(covariate)%*%solve(var_i))%*%(y-covariate%*%beta_est)
+        step12<-step12+xy%*%t(xy)
+        step13<-step13+vec(xy%*%t(xy))
+        p[,i]<-vec(xy%*%t(xy))
+      }else if (family=="poisson") {
+        D<-mat.prod(covariate, exp(covariate%*%beta_est))
+        Vi <- diag(sqrt(c(exp(covariate%*%beta_est))),cluster$n[i])%*%var_i%*%diag(sqrt(c(exp(covariate%*%beta_est))),cluster$n[i])
+        xy<-t(D)%*%solve(Vi)%*%mat.sqrt.inv(cormax.ind(cluster$n[i])-D%*%solve(step11)%*%t(D)%*%solve(Vi))%*%(y-exp(covariate%*%beta_est))
+        step12<-step12+xy%*%t(xy)
+        step13<-step13+vec(xy%*%t(xy))
+        p[,i]<-vec(xy%*%t(xy))
+      }else if (family=="binomial"){
+        D<-mat.prod(covariate, exp(covariate%*%beta_est)/((1+exp(covariate%*%beta_est))^2))
+        Vi <- diag(sqrt(c(exp(covariate%*%beta_est)/(1+exp(covariate%*%beta_est))^2)),cluster$n[i])%*%var_i%*%diag(sqrt(c(exp(covariate%*%beta_est)/(1+exp(covariate%*%beta_est))^2)),cluster$n[i])
+        xy<-t(D)%*%solve(Vi)%*%mat.sqrt.inv(cormax.ind(cluster$n[i])-D%*%solve(step11)%*%t(D)%*%solve(Vi))%*%(y-exp(covariate%*%beta_est)/(1+exp(covariate%*%beta_est)))
+        step12<-step12+xy%*%t(xy)
+        step13<-step13+vec(xy%*%t(xy))
+        p[,i]<-vec(xy%*%t(xy)) 
+      }    
+    }
+    for (i in 1:size){
+      dif<-(p[,i]-step13/size)%*%t(p[,i]-step13/size)
+      step14<-step14+dif
+    }
+    cov.beta<-solve(step11)%*%(step12)%*%solve(step11)
+    cov.var<-size/(size-1)*kronecker(solve(step11), solve(step11))%*%step14%*%kronecker(solve(step11), solve(step11))
+    return(list(cov.beta=cov.beta, cov.var=cov.var))
+  }
+
+
+
+aug_ATEs <- function(data){
+  
+  J <- length(unique(data$j))
+  I <- length(unique(data$i))
+  
+  # i-ATE
+  data$w_iATE <- 1
+  
+  # cp-ATE
+  data$w_cpATE <- 1 / data$Nij
+  
+  # c-ATE
+  cluster_sizes <- data %>%
+    group_by(i, j) %>%
+    summarise(Nij_unique = first(Nij), .groups = "drop") %>%
+    group_by(i) %>%
+    summarise(N_i = sum(Nij_unique), .groups = "drop")
+  
+  data <- data %>%
+    left_join(cluster_sizes, by = "i") %>%
+    mutate(w_cATE = 1 / N_i)
+  
+  # p-ATE
+  period_sizes <- data %>%
+    group_by(i, j) %>%
+    summarise(Nij_unique = first(Nij), .groups = "drop") %>%
+    group_by(j) %>%
+    summarise(N_j = sum(Nij_unique), .groups = "drop")
+  
+  data <- data %>%
+    left_join(period_sizes, by = "j") %>%
+    mutate(w_pATE = 1 / N_j)
+  
+  
+  X <- model.matrix(~ 0+factor(j)*Zij, data = data)
+  
+  X <- X[, -c(J+1, 2*J), drop = FALSE]
+  colnames(X) <- c(paste("p",1:J,sep=""),paste("pz",2:(J-1),sep="") )
+  
+  data <- data.frame(cbind(data, as.data.frame(X)))
+  
+  
+  cp_data <- data %>% group_by(i,j) %>%
+    summarise(Yij = mean(y),
+              wij_iATE = sum(w_iATE),
+              wij_cpATE = sum(w_cpATE),
+              wij_cATE = sum(w_cATE),
+              wij_pATE = sum(w_pATE),
+              Zij = first(Zij),
+              x1_bar = mean(x1),
+              x2_bar = mean(x2),
+              Nij = first(Nij),
+              pz2 = first(pz2),
+              pz3 = first(pz3),
+              pz4 = first(pz4),
+              pz5 = first(pz5),
+              p1 = first(p1),
+              p2 = first(p2),
+              p3 = first(p3),
+              p4 = first(p4),
+              p5 = first(p5),
+              p6 = first(p6),
+              .groups = "drop")
+  
+  p_data <- cp_data %>% group_by(j) %>% 
+    summarise(wj_iATE = sum(wij_iATE),
+              wj_cpATE = sum(wij_cpATE),
+              wj_cATE = sum(wij_cATE),
+              wj_pATE = sum(wij_pATE),
+              .groups = "drop")
+  
+  cp_data_z <- cp_data %>%
+    group_by(j, Zij) %>%
+    summarise(
+      # Numerator and denominator for each weighting scheme
+      num_iATE  = sum(wij_iATE  * Yij),
+      den_iATE  = sum(wij_iATE),
+      
+      num_cpATE = sum(wij_cpATE * Yij),
+      den_cpATE = sum(wij_cpATE),
+      
+      num_cATE  = sum(wij_cATE  * Yij),
+      den_cATE  = sum(wij_cATE),
+      
+      num_pATE  = sum(wij_pATE  * Yij),
+      den_pATE  = sum(wij_pATE),
+      .groups   = "drop"
+    ) %>%
+    # Join period-level total weights
+    left_join(p_data, by = "j") %>%
+    mutate(
+      # Period-level means
+      Ybar_j_iATE  = num_iATE  / den_iATE,
+      Ybar_j_cpATE = num_cpATE / den_cpATE,
+      Ybar_j_cATE  = num_cATE  / den_cATE,
+      Ybar_j_pATE  = num_pATE  / den_pATE
+    )
+  
+  mu_unadj <- cp_data_z %>%
+    filter(j > 1 & j < J) %>%               
+    group_by(Zij) %>%
+    summarise(
+      mu_h_iATE_unadj  = sum(wj_iATE  * Ybar_j_iATE ) / sum(wj_iATE ),
+      mu_v_cATE_unadj = sum(wj_cpATE * Ybar_j_cpATE) / sum(wj_cpATE),
+      mu_h_cATE_unadj  = sum(wj_cATE  * Ybar_j_cATE ) / sum(wj_cATE ),
+      mu_v_iATE_unadj  = sum(wj_pATE  * Ybar_j_pATE ) / sum(wj_pATE ),
+      .groups = "drop"
+    )
+  
+  ATEs_unadj <- mu_unadj %>%
+    arrange(Zij) %>%
+    summarise(
+      `h-iATE`  = diff(mu_h_iATE_unadj),
+      `v-cATE` = diff(mu_v_cATE_unadj),
+      `h-cATE`  = diff(mu_h_cATE_unadj),
+      `v-iATE`  = diff(mu_v_iATE_unadj)
+    )
+  
+  
+  ## Augmented estimators
+  
+  model_aug_mu <- NULL
+  model_aug_ATEs <- NULL
+
+  for (m in 1:6) {
+    
+    if (m == 1) {
+      fit <- gee(
+        y ~ 0 + factor(j) + Zij + x1 + x2 + Nij,
+        id = i,
+        data = data,
+        family = gaussian,
+        corstr = "independence"
+      )
+      coef <- coef(fit)
+      pred0 <- cp_data %>%
+        select(p1, p2, p3, p4, p5, p6, Zij, x1_bar, x2_bar, Nij) %>%
+        mutate(Zij = 0)
+      pred1 <- cp_data %>%
+        select(p1, p2, p3, p4, p5, p6, Zij, x1_bar, x2_bar, Nij) %>%
+        mutate(Zij = 1)
+      
+    } else if (m == 2) {
+      fit <- gee(
+        y ~ 0 + factor(j) + x1 + x2 + Nij + pz2 + pz3 + pz4 + pz5,
+        id = i,
+        data = data,
+        family = gaussian,
+        corstr = "independence"
+      )
+      coef <- coef(fit)
+      pred0 <- cp_data %>%
+        mutate(pz2 = 0, pz3 = 0, pz4 = 0, pz5 = 0) %>%
+        select(p1, p2, p3, p4, p5, p6, x1_bar, x2_bar, Nij, pz2, pz3, pz4, pz5)
+      pred1 <- cp_data %>%
+        mutate(pz2 = p2 * 1, pz3 = p3 * 1, pz4 = p4 * 1, pz5 = p5 * 1) %>%
+        select(p1, p2, p3, p4, p5, p6, x1_bar, x2_bar, Nij, pz2, pz3, pz4, pz5)
+      
+    } else if (m == 3) {
+      fit <- lmer(
+        y ~ 0 + factor(j) + Nij + x1 + x2 + Zij + (1 | i),
+        data = data
+      )
+      coef <- fixef(fit)
+      pred0 <- cp_data %>%
+        select(p1, p2, p3, p4, p5, p6, Nij, x1_bar, x2_bar, Zij) %>%
+        mutate(Zij = 0)
+      pred1 <- cp_data %>%
+        select(p1, p2, p3, p4, p5, p6, Nij, x1_bar, x2_bar, Zij) %>%
+        mutate(Zij = 1)
+      
+    } else if (m == 4) {
+      fit <- lmer(
+        y ~ 0 + factor(j) + pz2 + pz3 + pz4 + pz5 + x1 + x2 + Nij + (1 | i),
+        data = data
+      )
+      coef <- fixef(fit)
+      pred0 <- cp_data %>%
+        mutate(pz2 = 0, pz3 = 0, pz4 = 0, pz5 = 0) %>%
+        select(p1, p2, p3, p4, p5, p6, pz2, pz3, pz4, pz5, x1_bar, x2_bar, Nij)
+      pred1 <- cp_data %>%
+        mutate(pz2 = p2 * 1, pz3 = p3 * 1, pz4 = p4 * 1, pz5 = p5 * 1) %>%
+        select(p1, p2, p3, p4, p5, p6, pz2, pz3, pz4, pz5, x1_bar, x2_bar, Nij)
+      
+    } else if (m == 5) {
+      fit <- lmer(
+        y ~ 0 + factor(j) + Nij + x1 + x2 + Zij + (1 | i) + (1 | i:j),
+        data = data
+      )
+      coef <- fixef(fit)
+      pred0 <- cp_data %>%
+        select(p1, p2, p3, p4, p5, p6, Nij, x1_bar, x2_bar, Zij) %>%
+        mutate(Zij = 0)
+      pred1 <- cp_data %>%
+        select(p1, p2, p3, p4, p5, p6, Nij, x1_bar, x2_bar, Zij) %>%
+        mutate(Zij = 1)
+      
+    } else if (m == 6) {
+      fit <- lmer(
+        y ~ 0 + factor(j) + pz2 + pz3 + pz4 + pz5 + x1 + x2 + Nij + (1 | i) + (1 | i:j),
+        data = data
+      )
+      coef <- fixef(fit)
+      pred0 <- cp_data %>%
+        mutate(pz2 = 0, pz3 = 0, pz4 = 0, pz5 = 0) %>%
+        select(p1, p2, p3, p4, p5, p6, pz2, pz3, pz4, pz5, x1_bar, x2_bar, Nij)
+      pred1 <- cp_data %>%
+        mutate(pz2 = p2 * 1, pz3 = p3 * 1, pz4 = p4 * 1, pz5 = p5 * 1) %>%
+        select(p1, p2, p3, p4, p5, p6, pz2, pz3, pz4, pz5, x1_bar, x2_bar, Nij)
+    }
+    
+
+  
+    
+    cp_data$m0 <- as.numeric(as.matrix(pred0) %*% coef )
+    cp_data$m1 <- as.numeric(as.matrix(pred1) %*% coef )
+    
+    ## calculate augmentation part
+    cp_data_aug <- cp_data %>%
+      left_join(p_data, by = "j")
+    
+    cp_data_cross <- cp_data_aug %>%
+      crossing(pot_z = c(0, 1)) %>%
+      # For each potential outcome, assign the corresponding predicted value:
+      mutate(mz = if_else(pot_z == 0, m0, m1))
+    
+    cp_long <- cp_data_cross %>%
+      pivot_longer(
+        cols = starts_with("wij_"),
+        names_to = "weight_scheme",
+        names_prefix = "wij_",
+        values_to = "w_ij"
+      ) %>%
+      mutate(
+        w_j = case_when(
+          weight_scheme == "iATE"  ~ wj_iATE,
+          weight_scheme == "cpATE" ~ wj_cpATE,
+          weight_scheme == "cATE"  ~ wj_cATE,
+          weight_scheme == "pATE"  ~ wj_pATE
+        )
+      )
+    
+    aug_data <- cp_long %>%
+      group_by(j, weight_scheme, pot_z) %>%
+      summarise(
+        # Numerator and denominator for the first term
+        num_term1 = sum(w_ij * if_else(Zij == pot_z, 1, 0) * (Yij - mz)),
+        den_term1 = sum(w_ij * if_else(Zij == pot_z, 1, 0)),
+        # Weighted sum of mz for the second term
+        sum_mz = sum(w_ij * mz),
+        w_j = first(w_j),   # period-level sum of w_ij
+        .groups = "drop"
+      ) %>%
+      # Calculate the two terms and final augmented estimate
+      mutate(
+        term1 = num_term1 / den_term1,
+        term2 = sum_mz / w_j,
+        mu_aug = term1 + term2
+      )
+    
+    
+    final_agg <- aug_data %>%
+      # Exclude periods j=1 and j=J
+      filter(j > 1, j < J) %>%
+      # Group by weighting scheme and potential treatment
+      group_by(weight_scheme, pot_z) %>%
+      summarise(
+        numerator   = sum(w_j * mu_aug),
+        denominator = sum(w_j),
+        mu_aug_overall = numerator / denominator,
+        .groups = "drop"
+      )
+    
+    final_table <- final_agg %>%
+      select(pot_z, weight_scheme, mu_aug_overall) %>%
+      pivot_wider(
+        names_from = weight_scheme,
+        values_from = mu_aug_overall,
+        names_prefix = "mu_"
+      ) %>%
+      rename(Zij = pot_z) %>%
+      arrange(Zij) %>%
+      select(Zij, mu_iATE, mu_cpATE, mu_cATE, mu_pATE) %>%
+      rename(
+        mu_h_iATE_unadj  = mu_iATE,
+        mu_v_cATE_unadj = mu_cpATE,
+        mu_h_cATE_unadj  = mu_cATE,
+        mu_v_iATE_unadj  = mu_pATE
+      )  %>% mutate(model = paste0("m", m))
+    
+    ATEs_aug <- final_table %>%
+      arrange(Zij) %>%
+      summarise(
+        `h-iATE`  = diff(mu_h_iATE_unadj),
+        `v-cATE` = diff(mu_v_cATE_unadj),
+        `h-cATE`  = diff(mu_h_cATE_unadj),
+        `v-iATE`  = diff(mu_v_iATE_unadj)
+      ) %>%
+      mutate(model = paste0("m", m))
+    
+    
+    model_aug_mu <- bind_rows(model_aug_mu, final_table)
+    model_aug_ATEs <- bind_rows(model_aug_ATEs, ATEs_aug)
+    
+
+  
+  }
+  
+  
+  model_aug_mu <- rbind(model_aug_mu,data.frame(mu_unadj,model="unadj"))
+  model_aug_ATEs <- rbind(model_aug_ATEs, ATEs_unadj %>% mutate(model = "unadj"))
+  
+  
+  return(list(model_aug_mu,model_aug_ATEs))
+
+  
+}
+
+
+ANCOVA_ATE <- function(data){
+  J <- length(unique(data$j))
+  I <- length(unique(data$i))
+  
+  # i-ATE
+  data$w_iATE <- 1
+  
+  # cp-ATE
+  data$w_cpATE <- 1 / data$Nij
+  
+  # c-ATE
+  cluster_sizes <- data %>%
+    group_by(i, j) %>%
+    summarise(Nij_unique = first(Nij), .groups = "drop") %>%
+    group_by(i) %>%
+    summarise(N_i = sum(Nij_unique), .groups = "drop")
+  
+  data <- data %>%
+    left_join(cluster_sizes, by = "i") %>%
+    mutate(w_cATE = 1 / N_i)
+  
+  # p-ATE
+  period_sizes <- data %>%
+    group_by(i, j) %>%
+    summarise(Nij_unique = first(Nij), .groups = "drop") %>%
+    group_by(j) %>%
+    summarise(N_j = sum(Nij_unique), .groups = "drop")
+  
+  data <- data %>%
+    left_join(period_sizes, by = "j") %>%
+    mutate(w_pATE = 1 / N_j)
+  
+  
+  X <- model.matrix(~ 0+factor(j)*Zij, data = data)
+  
+  X <- X[, -c(J+1, 2*J), drop = FALSE]
+  colnames(X) <- c(paste("p",1:J,sep=""),paste("pz",2:(J-1),sep="") )
+  
+  data <- data.frame(cbind(data, as.data.frame(X)))
+  
+  ## prepare for model 9 covariates
+  data <- data %>%
+    group_by(j) %>% 
+    mutate(
+      # For x1 with iATE weights:
+      x1_bar_iATE  = sum(w_iATE * x1) / sum(w_iATE),
+      tilde_x1_iATE = x1 - x1_bar_iATE,
+      # For x1 with cpATE weights:
+      x1_bar_cpATE = sum(w_cpATE * x1) / sum(w_cpATE),
+      tilde_x1_cpATE = x1 - x1_bar_cpATE,
+      # For x1 with cATE weights:
+      x1_bar_cATE  = sum(w_cATE * x1) / sum(w_cATE),
+      tilde_x1_cATE = x1 - x1_bar_cATE,
+      # For x1 with pATE weights:
+      x1_bar_pATE  = sum(w_pATE * x1) / sum(w_pATE),
+      tilde_x1_pATE = x1 - x1_bar_pATE,
+      
+      # For x2 with iATE weights:
+      x2_bar_iATE  = sum(w_iATE * x2) / sum(w_iATE),
+      tilde_x2_iATE = x2 - x2_bar_iATE,
+      # For x2 with cpATE weights:
+      x2_bar_cpATE = sum(w_cpATE * x2) / sum(w_cpATE),
+      tilde_x2_cpATE = x2 - x2_bar_cpATE,
+      # For x2 with cATE weights:
+      x2_bar_cATE  = sum(w_cATE * x2) / sum(w_cATE),
+      tilde_x2_cATE = x2 - x2_bar_cATE,
+      # For x2 with pATE weights:
+      x2_bar_pATE  = sum(w_pATE * x2) / sum(w_pATE),
+      tilde_x2_pATE = x2 - x2_bar_pATE
+    ) %>%
+    ungroup()
+  
+  
+  cp_data <- data %>% group_by(i,j) %>%
+    summarise(Yij = mean(y),
+              wij_iATE = sum(w_iATE),
+              wij_cpATE = sum(w_cpATE),
+              wij_cATE = sum(w_cATE),
+              wij_pATE = sum(w_pATE),
+              Zij = first(Zij),
+              x1_bar = mean(x1),
+              x2_bar = mean(x2),
+              Nij = first(Nij),
+              pz2 = first(pz2),
+              pz3 = first(pz3),
+              pz4 = first(pz4),
+              pz5 = first(pz5),
+              p1 = first(p1),
+              p2 = first(p2),
+              p3 = first(p3),
+              p4 = first(p4),
+              p5 = first(p5),
+              p6 = first(p6),
+              .groups = "drop")
+  
+  p_data <- cp_data %>% group_by(j) %>% 
+    summarise(wj_iATE = sum(wij_iATE),
+              wj_cpATE = sum(wij_cpATE),
+              wj_cATE = sum(wij_cATE),
+              wj_pATE = sum(wij_pATE),
+              .groups = "drop")
+  
+  #################################### Linear mixed model & GEE with individual-level observations ####################################
+  
+  p_sub <- p_data %>% filter(j >= 2, j < max(j))
+  
+  weight_cols <- c("wj_iATE", "wj_cpATE", "wj_cATE", "wj_pATE")
+  scheme_names <- c("iATE", "cpATE", "cATE", "pATE")
+  
+  
+  ## --------------- Model 1 --------------- ##
+  model1_fit <- gee(
+    y ~ 0 + factor(j) + Nij + x1 + x2 + Zij,
+    id     = i,
+    data   = data,
+    family = gaussian,
+    corstr = "independence"
+  )
+  model1_est <- rep(coef(model1_fit)[10], 4)
+  model1_var <- GEE.var.kc(
+    y ~ 0 + factor(j) + Nij + x1 + x2 + Zij,
+    id     = "i",
+    data   = as.data.frame(data),
+    family = gaussian,
+    corstr = "independence"
+  )[[1]]
+  model1_se  <- rep(sqrt(model1_var[10,10]), 4)
+  
+  
+  ## --------------- Model 2 --------------- ##
+  model2_fit  <- gee(
+    y ~ 0 + factor(j) + pz2 + pz3 + pz4 + pz5 + Nij + x1 + x2,
+    id     = i,
+    data   = data,
+    family = gaussian,
+    corstr = "independence"
+  )
+  model2_parm <- coef(model2_fit)[7:10]
+  model2_var  <- GEE.var.kc(
+    y ~ 0 + factor(j) + pz2 + pz3 + pz4 + pz5 + Nij + x1 + x2,
+    id     = "i",
+    data   = as.data.frame(data),
+    family = gaussian,
+    corstr = "independence"
+  )[[1]]
+  model2_cov  <- model2_var[7:10,7:10]
+  model2_est  <- sapply(weight_cols, function(wcol) {
+    w <- p_sub[[wcol]]
+    sum(w * model2_parm) / sum(w)
+  })
+  model2_se   <- sapply(weight_cols, function(wcol) {
+    w     <- p_sub[[wcol]]
+    c_vec <- w / sum(w)
+    sqrt(as.numeric(t(c_vec) %*% model2_cov %*% c_vec))
+  })
+  
+  
+  ## --------------- Model 3 --------------- ##
+  model3_fit <- lmer(
+    y ~ 0 + factor(j) + Nij + x1 + x2 + Zij + (1 | i),
+    data = data
+  )
+  model3_est <- rep(fixef(model3_fit)[10], 4)
+  model3_se  <- rep(sqrt(vcovCR(model3_fit, type = "CR3")[10,10]), 4)
+  
+  
+  ## --------------- Model 4 --------------- ##
+  model4_fit  <- lmer(
+    y ~ 0 + factor(j) + pz2 + pz3 + pz4 + pz5 + Nij + x1 + x2 + (1 | i),
+    data = data
+  )
+  model4_parm <- fixef(model4_fit)[7:10]
+  model4_cov  <- vcovCR(model4_fit, type = "CR3")[7:10,7:10]
+  model4_est  <- sapply(weight_cols, function(wcol) {
+    w <- p_sub[[wcol]]
+    sum(w * model4_parm) / sum(w)
+  })
+  model4_se   <- sapply(weight_cols, function(wcol) {
+    w     <- p_sub[[wcol]]
+    c_vec <- w / sum(w)
+    sqrt(as.numeric(t(c_vec) %*% model4_cov %*% c_vec))
+  })
+  
+  
+  ## --------------- Model 5 --------------- ##
+  model5_fit <- lmer(
+    y ~ 0 + factor(j) + Nij + x1 + x2 + Zij +
+      (1 | i) + (1 | i:j),
+    data = data
+  )
+  model5_est <- rep(fixef(model5_fit)[10], 4)
+  model5_se  <- rep(sqrt(vcovCR(model5_fit, type = "CR3")[10,10]), 4)
+  
+  
+  ## --------------- Model 6 --------------- ##
+  model6_fit  <- lmer(
+    y ~ 0 + factor(j) + pz2 + pz3 + pz4 + pz5 + Nij + x1 + x2 + (1 | i) + (1 | i:j),
+    data = data
+  )
+  model6_parm <- fixef(model6_fit)[7:10]
+  model6_cov  <- vcovCR(model6_fit, type = "CR3")[7:10,7:10]
+  model6_est  <- sapply(weight_cols, function(wcol) {
+    w <- p_sub[[wcol]]
+    sum(w * model6_parm) / sum(w)
+  })
+  model6_se   <- sapply(weight_cols, function(wcol) {
+    w     <- p_sub[[wcol]]
+    c_vec <- w / sum(w)
+    sqrt(as.numeric(t(c_vec) %*% model6_cov %*% c_vec))
+  })
+  
+  
+  ## --------------- Model 7 --------------- ##
+  # i-ATE
+  model7_i_fit  <- lm(
+    y ~ 0 + factor(j) + tilde_x1_iATE + tilde_x2_iATE +
+      pz2 + pz3 + pz4 + pz5 +
+      tilde_x1_iATE:Zij + tilde_x2_iATE:Zij,
+    weights = w_iATE,
+    data    = data
+  )
+  model7_i_parm <- coef(model7_i_fit)[9:12]
+  model7_i_cov  <- vcovCR(model7_i_fit, cluster = data$i, type = "CR3")[9:12,9:12]
+  model7_i_est  <- sum(p_sub$wj_iATE * model7_i_parm) / sum(p_sub$wj_iATE)
+  model7_i_se   <- sqrt(as.numeric(
+    t(p_sub$wj_iATE/sum(p_sub$wj_iATE)) %*% model7_i_cov %*%
+      (p_sub$wj_iATE/sum(p_sub$wj_iATE))
+  ))
+  
+  # cp-ATE
+  model7_cp_fit  <- lm(
+    y ~ 0 + factor(j) + tilde_x1_cpATE + tilde_x2_cpATE +
+      pz2 + pz3 + pz4 + pz5 +
+      tilde_x1_cpATE:Zij + tilde_x2_cpATE:Zij,
+    weights = w_cpATE,
+    data    = data
+  )
+  model7_cp_parm <- coef(model7_cp_fit)[9:12]
+  model7_cp_cov  <- vcovCR(model7_cp_fit, cluster = data$i, type = "CR3")[9:12,9:12]
+  model7_cp_est  <- sum(p_sub$wj_cpATE * model7_cp_parm) / sum(p_sub$wj_cpATE)
+  model7_cp_se   <- sqrt(as.numeric(
+    t(p_sub$wj_cpATE/sum(p_sub$wj_cpATE)) %*% model7_cp_cov %*%
+      (p_sub$wj_cpATE/sum(p_sub$wj_cpATE))
+  ))
+  
+  # c-ATE
+  model7_c_fit  <- lm(
+    y ~ 0 + factor(j) + tilde_x1_cATE + tilde_x2_cATE +
+      pz2 + pz3 + pz4 + pz5 +
+      tilde_x1_cATE:Zij + tilde_x2_cATE:Zij,
+    weights = w_cATE,
+    data    = data
+  )
+  model7_c_parm <- coef(model7_c_fit)[9:12]
+  model7_c_cov  <- vcovCR(model7_c_fit, cluster = data$i, type = "CR3")[9:12,9:12]
+  model7_c_est  <- sum(p_sub$wj_cATE * model7_c_parm) / sum(p_sub$wj_cATE)
+  model7_c_se   <- sqrt(as.numeric(
+    t(p_sub$wj_cATE/sum(p_sub$wj_cATE)) %*% model7_c_cov %*%
+      (p_sub$wj_cATE/sum(p_sub$wj_cATE))
+  ))
+  
+  # p-ATE
+  model7_p_fit  <- lm(
+    y ~ 0 + factor(j) + tilde_x1_pATE + tilde_x2_pATE +
+      pz2 + pz3 + pz4 + pz5 +
+      tilde_x1_pATE:Zij + tilde_x2_pATE:Zij,
+    weights = w_pATE,
+    data    = data
+  )
+  model7_p_parm <- coef(model7_p_fit)[9:12]
+  model7_p_cov  <- vcovCR(model7_p_fit, cluster = data$i, type = "CR3")[9:12,9:12]
+  model7_p_est  <- sum(p_sub$wj_pATE * model7_p_parm) / sum(p_sub$wj_pATE)
+  model7_p_se   <- sqrt(as.numeric(
+    t(p_sub$wj_pATE/sum(p_sub$wj_pATE)) %*% model7_p_cov %*%
+      (p_sub$wj_pATE/sum(p_sub$wj_pATE))
+  ))
+  
+  model7_est <- c(model7_i_est, model7_cp_est, model7_c_est, model7_p_est)
+  model7_se  <- c(model7_i_se,  model7_cp_se,  model7_c_se,  model7_p_se)
+  
+  
+  ## --------------- Model 8 --------------- ##
+  model8_fit <- gee(
+    y ~ 0 + factor(j) + Zij,
+    id     = i,
+    data   = data,
+    family = gaussian,
+    corstr = "independence"
+  )
+  model8_var <- GEE.var.kc(
+    y ~ 0 + factor(j) + Zij,
+    id     = "i",
+    data   = as.data.frame(data),
+    family = gaussian,
+    corstr = "independence"
+  )[[1]]
+  model8_est <- rep(coef(model8_fit)[7], 4)
+  model8_se  <- rep(sqrt(model8_var[7,7]), 4)
+  
+  
+  ## --------------- Model 9 --------------- ##
+  model9_fit <- gee(
+    y ~ 0 + factor(j) + pz2 + pz3 + pz4 + pz5,
+    id     = i,
+    data   = data,
+    family = gaussian,
+    corstr = "independence"
+  )
+  model9_parm <- coef(model9_fit)[7:10]
+  model9_var  <- GEE.var.kc(
+    y ~ 0 + factor(j) + pz2 + pz3 + pz4 + pz5,
+    id     = "i",
+    data   = as.data.frame(data),
+    family = gaussian,
+    corstr = "independence"
+  )[[1]]
+  model9_cov  <- model9_var[7:10,7:10]
+  model9_est  <- sapply(weight_cols, function(wcol) {
+    w <- p_sub[[wcol]]
+    sum(w * model9_parm) / sum(w)
+  })
+  model9_se   <- sapply(weight_cols, function(wcol) {
+    w     <- p_sub[[wcol]]
+    c_vec <- w / sum(w)
+    sqrt(as.numeric(t(c_vec) %*% model9_cov %*% c_vec))
+  })
+  
+  
+  ## --------------- Model 10 --------------- ##
+  model10_fit <- lmer(
+    y ~ 0 + factor(j) + Zij + (1 | i),
+    data = data
+  )
+  model10_est <- rep(fixef(model10_fit)[J + 1], 4)
+  model10_se  <- rep(sqrt(vcovCR(model10_fit, type = "CR3")[J + 1, J + 1]), 4)
+  
+  
+  ## --------------- Model 11 --------------- ##
+  model11_fit <- lmer(
+    y ~ 0 + factor(j) + pz2 + pz3 + pz4 + pz5 + (1 | i),
+    data = data
+  )
+  model11_parm <- fixef(model11_fit)[7:10]
+  model11_cov  <- vcovCR(model11_fit, type = "CR3")[7:10,7:10]
+  model11_est  <- sapply(weight_cols, function(wcol) {
+    w <- p_sub[[wcol]]
+    sum(w * model11_parm) / sum(w)
+  })
+  model11_se   <- sapply(weight_cols, function(wcol) {
+    w     <- p_sub[[wcol]]
+    c_vec <- w / sum(w)
+    sqrt(as.numeric(t(c_vec) %*% model11_cov %*% c_vec))
+  })
+  
+  
+  ## --------------- Model 12 --------------- ##
+  model12_fit <- lmer(
+    y ~ 0 + factor(j) + Zij + (1 | i) + (1 | i:j),
+    data = data
+  )
+  model12_est <- rep(fixef(model12_fit)[J + 1], 4)
+  model12_se  <- rep(sqrt(vcovCR(model12_fit, type = "CR3")[J + 1, J + 1]), 4)
+  
+  
+  ## --------------- Model 13 --------------- ##
+  model13_fit <- lmer(
+    y ~ 0 + factor(j) + pz2 + pz3 + pz4 + pz5 + (1 | i) + (1 | i:j),
+    data = data
+  )
+  model13_parm <- fixef(model13_fit)[7:10]
+  model13_cov  <- vcovCR(model13_fit, type = "CR3")[7:10,7:10]
+  model13_est  <- sapply(weight_cols, function(wcol) {
+    w <- p_sub[[wcol]]
+    sum(w * model13_parm) / sum(w)
+  })
+  model13_se   <- sapply(weight_cols, function(wcol) {
+    w     <- p_sub[[wcol]]
+    c_vec <- w / sum(w)
+    sqrt(as.numeric(t(c_vec) %*% model13_cov %*% c_vec))
+  })
+  
+  
+  ## --------------- Final assembly --------------- ##
+  model_ATE    <- as.data.frame(rbind(
+    model1_est, model2_est, model3_est, model4_est, model5_est,
+    model6_est, model7_est, model8_est, model9_est, model10_est,
+    model11_est, model12_est, model13_est
+  ))
+  model_ATE_se <- as.data.frame(rbind(
+    model1_se, model2_se, model3_se, model4_se, model5_se,
+    model6_se, model7_se, model8_se, model9_se, model10_se,
+    model11_se, model12_se, model13_se
+  ))
+  
+
+  
+  colnames(model_ATE)    <- colnames(model_ATE_se)    <- 
+    c("h-iATE","v-cATE","h-cATE","v-hATE")
+  model_ATE$model        <- 1:13
+  model_ATE_se$model     <- 1:13
+  rownames(model_ATE)    <- NULL
+  rownames(model_ATE_se) <- NULL
+  
+  
+  return(list(model_ATE,model_ATE_se))
+  
+}
+
+

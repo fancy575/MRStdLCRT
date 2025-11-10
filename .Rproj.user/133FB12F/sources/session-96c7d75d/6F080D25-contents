@@ -1,0 +1,56 @@
+# Example: continuous outcome with lmer
+# Run: Rscript play_continuous.R
+
+suppressPackageStartupMessages({
+  library(MRStdLCRT)   # your package
+})
+
+# load example data shipped with the package
+data("ex_c", package = "MRStdLCRT")
+
+# analysis formula (matches simulate columns)
+fml_c <- y ~ 0 + factor(period)*trt +
+  x1 + x2 +
+  (1 | cluster) + (1 | cluster:period)
+
+fml_c <- y ~ trt
+
+# fit using lmer (gaussian)
+fit_c <- mrstdlcrt_fit(
+  data       = ex_c,
+  formula    = fml_c,
+  cluster_id = "cluster",
+  period     = "period",
+  trt        = "trt",
+  method     = "gee",
+  family     = "gaussian",
+  SW=TRUE
+)
+
+data("ex_b", package = "MRStdLCRT")
+
+
+fml_b <- y~ 0 + factor(period)*trt  + (1 | cluster) + (1 | cluster:period)
+
+fit_b <- mrstdlcrt_fit(
+  data       = ex_b,
+  formula    = fml_b,
+  cluster_id = "cluster",
+  period     = "period",
+  trt        = "trt",
+  method     = "glmer",
+  family     = "binomial",
+  SW=T
+)
+
+# print the summary (95% by default; change with level = 0.9, etc.)
+summary(fit_b, level = 0.95)
+
+# --- optional: programmatic access to pieces ---
+# str(fit_c)                        # see components
+# fit_c$estimates                   # unadjusted/augmented h-iATE, h-cATE, diff
+# fit_c$jk_se                       # corresponding jackknife SEs
+# fit_c$meta                        # metadata: clusters, periods, N, method, corstr, formula
+
+
+plot(fit_b)

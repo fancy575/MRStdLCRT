@@ -1,0 +1,50 @@
+source("gen_data.R")
+source("Aug_ancova.R")
+source("jk_var.R")
+
+
+
+M <- 1000
+aug_out <- list()
+ancova_out <- list()
+
+
+for(m in 1:M){
+  
+  gen_data <- sim_data(I=30, J=4, cpl=5, cpu=50, b0_s = 0.05, b0_e = 0.25, 
+                       alpha_v=0.3, delta_v=0.3,
+                       pi_x1 = 0.1,var_x2 = 0.01, theta0 = 0.5,
+                       theta1 = 0.5,         # coefficient for sin(X1)
+                       theta2 = 1,    # coefficient for logistic term
+                       theta2_in1 = 1/3,  
+                       theta2_in2 = 1,
+                       parm_N=1/3,
+                       seed = 223*m)
+  
+  # suppressMessages(suppressWarnings(
+  #   tryCatch({
+  #     aug_est <- aug_ATEs(gen_data)  
+  #     aug_se  <- var_est(gen_data)
+  #     aug_out[[m]] <- list(aug_est[[2]], aug_se)
+  #   }, error = function(e){
+  #     aug_out[[m]] <- list()  # Simply store an empty list on error
+  #   })
+  # ))
+  
+  suppressMessages(suppressWarnings(
+    tryCatch({
+      ancova_est <- ANCOVA_ATE(gen_data)
+      ancova_out[[m]] <- ancova_est
+    }, error = function(e){
+      ancova_out[[m]] <- list()  
+    })
+  ))
+  
+  print(m)
+ 
+
+ # save(aug_out,file="aug_sm_s2(13).RData")
+ save(ancova_out,file="ancova_sm_s2(2).RData")
+ 
+  
+}

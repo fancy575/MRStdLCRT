@@ -1,0 +1,32 @@
+source("gen_data.R")
+source("Aug_ancova.R")
+source("jk_var.R")
+
+
+
+M <- 1000
+aug_out <- list()
+ancova_out <- list()
+
+
+for(m in 1:M){
+  gen_data <- sim_data(I = 30,J = 6, minN = 20, maxN = 100, beta0_start = 0.25,
+                       beta0_end = 0.27,var_x2 = 0.1,
+                       var_alpha = 0.05, var_delta = 0.05, var_eps = 0.9, 
+                       theta0 = 1/2, theta_sin = -1, theta_log_coef = -1.5,theta_log_lambda = 1,
+                       parm_N1 = 0.8, parm_N2=1.5,
+                       seed = 323*m)
+  
+ aug_est <- aug_ATEs(gen_data)  
+ aug_se <- var_est(gen_data)
+ aug_out[[m]] <- list(aug_est[[2]],aug_se)
+ 
+ ancova_est <- ANCOVA_ATE(gen_data)
+ ancova_out[[m]] <- ancova_est
+ 
+
+ save(aug_out,file="ATE_aug_s2(3).RData")
+ save(ancova_out,file="ATE_coef_s2(3).RData")
+ 
+  
+}

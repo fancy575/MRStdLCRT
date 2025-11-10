@@ -1,0 +1,593 @@
+#' Model-Robust Standardization for Crossover (MRS-XO)
+#'
+#' @description
+#' Core fitting functions for computing hospital-weighted individual ATE (h-iATE)
+#' and cluster ATE (h-cATE) in two-period, two-sequence crossover designs,
+#' with both unadjusted and augmented (model-robust) estimators, and
+#' delete-1-cluster jackknife SEs.
+#'
+#' @importFrom dplyr %>% group_by summarise mutate left_join arrange n distinct pull
+#' @importFrom dplyr ungroup select across bind_cols count filter first everything
+#' @importFrom tidyr pivot_longer pivot_wider crossing
+#' @importFrom rlang sym
+#' @importFrom lme4 lmer glmer fixef VarCorr
+#' @importFrom gee gee
+#' @importFrom stats model.frame model.matrix terms delete.response as.formula
+#' @importFrom stats gaussian binomial qt
+#' @keywords internal
+#' @name utilities
+
+utils::globalVariables(c(
+  ".", "Yij", "Z", "Nij", "N_i", "w_iATE", "w_cATE",
+  "wij_iATE", "wij_cATE", "w_j", "mz", "pot_z",
+  "num_term1", "den_term1", "sum_mz", "mu_aug",
+  "mu_aug_overall", "Z", "p", "h"
+))
+
+# ---------- helpers ----------
+.inv_logit <- function(eta) 1/(1+exp(-eta))
+.sdiv      <- function(a,b) ifelse(b==0, 0, a/b)
+
+# detect whether the RHS references factor(period) and/or factor(period)*trt
+.detect_period_usage <- function(fml, period_col, trt_col) {
+  tt  <- terms(fml)
+  tls <- gsub("\\s+", "", attr(tt, "term.labels"))
+  facp <- paste0("factor(", period_col, ")")
+  wants_p  <- any(tls == facp)
+  wants_pz <- any(tls %in% c(
+    paste0(facp, ":", trt_col),
+    paste0(trt_col, ":", facp),
+    paste0(facp, "*", trt_col),
+    paste0(trt_col, "*", facp)
+  ))
+  toks <- all.vars(update(fml, . ~ .))
+  wants_p  <- wants_p  || any(grepl("^p\\d+$",  toks))
+  wants_pz <- wants_pz || any(grepl("^pz\\d+$", toks))
+  list(wants_p = wants_p, wants_pz = wants_pz)
+}
+
+.add_p_cols_if_needed <- function(df, period_col, wants_p) {
+  if (!wants_p) return(df)
+  per_fac <- factor(df[[period_col]], levels = sort(unique(df[[period_col]])))
+  P <- model.matrix(~ 0 + per_fac)
+  colnames(P) <- paste0("p", seq_len(nlevels(per_fac)))
+  dplyr::bind_cols(df, as.data.frame(P))
+}
+
+.add_pz_cols_if_needed <- function(df, period_col, trt_col, wants_pz) {
+  if (!wants_pz) return(df)
+  per_fac <- factor(df[[period_col]], levels = sort(unique(df[[period_col]])))
+  per_idx <- as.integer(per_fac)
+  tr      <- as.integer(df[[trt_col]] == 1)
+  J <- nlevels(per_fac)
+  PZ <- sapply(seq_len(J), function(m) as.integer(per_idx == m) * tr)
+  PZ <- as.data.frame(PZ); names(PZ) <- paste0("pz", seq_len(J))
+  dplyr::bind_cols(df, PZ)
+}
+
+# strip any (1|...) terms (gee can't use RE)
+.strip_re_from_formula <- function(fml) {
+  f_txt <- paste(deparse(fml), collapse = "")
+  f_txt <- gsub("\\(\\s*1\\s*\\|[^\\)]*\\)", "", f_txt) # remove each (1|...)
+  f_txt <- gsub("\\+\\s*\\+","+", f_txt)                # tidy ++
+  stats::as.formula(f_txt, env = parent.frame())
+}
+
+.mm_fixed <- function(fit, newdata, method) {
+  if (method == "gee") {
+    TT <- delete.response(terms(formula(fit), data = newdata))
+    mf <- model.frame(TT, data = newdata)
+    X  <- model.matrix(TT, mf)
+    keep <- intersect(colnames(X), names(coef(fit)))
+    X[, keep, drop = FALSE]
+  } else {
+    TT <- delete.response(terms(fit))
+    mf <- model.frame(TT, data = newdata)
+    X  <- model.matrix(TT, mf)
+    keep <- intersect(colnames(X), names(lme4::fixef(fit)))
+    X[, keep, drop = FALSE]
+  }
+}
+
+# Predict at CP means (gaussian) or individual-level (binomial via gee/glmer path)
+.pred_cp_means_cp <- function(fit, method, family, cp_base, trt_col, period_col) {
+  new0 <- cp_base; new0[[trt_col]] <- 0L
+  new1 <- cp_base; new1[[trt_col]] <- 1L
+  pz_cols <- grep("^pz\\d+$", names(cp_base), value = TRUE)
+  if (length(pz_cols)) {
+    per_fac <- factor(cp_base[[period_col]], levels = sort(unique(cp_base[[period_col]])))
+    per_idx <- as.integer(per_fac); J <- nlevels(per_fac)
+    for (m in seq_len(J)) {
+      nm <- paste0("pz", m)
+      if (nm %in% pz_cols) {
+        new0[[nm]] <- as.integer(per_idx == m) * 0L
+        new1[[nm]] <- as.integer(per_idx == m) * 1L
+      }
+    }
+  }
+  X0 <- .mm_fixed(fit, new0, method)
+  X1 <- .mm_fixed(fit, new1, method)
+
+  if (method == "gee") {
+    b <- coef(fit)
+    eta0 <- drop(X0 %*% b[colnames(X0)])
+    eta1 <- drop(X1 %*% b[colnames(X1)])
+    if (family=="gaussian") { m0 <- eta0; m1 <- eta1 } else { m0 <- .inv_logit(eta0); m1 <- .inv_logit(eta1) }
+  } else if (inherits(fit,"lmerMod")) {
+    b <- lme4::fixef(fit)
+    m0 <- drop(X0 %*% b[colnames(X0)])
+    m1 <- drop(X1 %*% b[colnames(X1)])
+  } else { # glmer binomial -> latent scale adjust
+    b <- lme4::fixef(fit)
+    eta0 <- drop(X0 %*% b[colnames(X0)])
+    eta1 <- drop(X1 %*% b[colnames(X1)])
+    vc    <- lme4::VarCorr(fit)
+    sigma <- sum(sapply(vc, function(x) attr(x, "stddev")^2))
+    scale <- sqrt((sigma + pi^2/3) / (pi^2/3))
+    m0 <- .inv_logit(eta0/scale); m1 <- .inv_logit(eta1/scale)
+  }
+  list(m0 = m0, m1 = m1)
+}
+
+# ==============================================================
+#' Compute unadjusted & augmented h-iATE / h-cATE for XO data
+#'
+#' @param data data.frame with cluster \code{cluster_id}, period \code{period}, treatment \code{trt}, outcome in \code{formula}.
+#' @param formula model formula; may contain \code{factor(period)} and (optionally) random effects for lmer/glmer.
+#' @param cluster_id character name of cluster column (default "cluster")
+#' @param period character name of period column (default "period")
+#' @param trt character name of treatment column (default "trt")
+#' @param method one of \code{"gee"}, \code{"lmer"}, \code{"glmer"}
+#' @param family \code{"gaussian"} or \code{"binomial"}
+#' @param corstr working correlation for GEE (default "independence")
+#'
+#' @return a list with fitted object and ATE tables (internal)
+#' @noRd
+MRS_ATEs <- function(
+    data,
+    formula,                 # e.g., y ~ 0 + factor(p)*trt + x... + (1|h) + (1|h:p)
+    cluster_id = "cluster",
+    period     = "period",
+    trt        = "trt",
+    method  = c("gee","lmer","glmer"),
+    family  = c("gaussian","binomial"),
+    corstr  = "independence"
+){
+  method <- match.arg(method)
+  family <- match.arg(family)
+  if (method == "lmer"  && family != "gaussian") stop("lmer requires gaussian. Use glmer/gee for binomial.")
+  if (method == "glmer" && family != "binomial") stop("glmer requires binomial.")
+
+  df <- data
+
+  # add p*, pz* if formula implies it
+  needs <- .detect_period_usage(formula, period, trt)
+  if (needs$wants_p)  df <- .add_p_cols_if_needed(df, period, TRUE)
+  if (needs$wants_pz) df <- .add_pz_cols_if_needed(df, period, trt, TRUE)
+
+  cluster_sym <- rlang::sym(cluster_id)
+  period_sym  <- rlang::sym(period)
+
+  # cluster-period sizes & totals
+  cp_sizes <- df %>% dplyr::count(!!cluster_sym, !!period_sym, name = "Nij")
+  N_i <- cp_sizes %>% dplyr::group_by(!!cluster_sym) %>%
+    dplyr::summarise(N_i = sum(Nij), .groups="drop")
+  df <- df %>%
+    dplyr::left_join(cp_sizes, by = setNames(c(cluster_id, period), c(cluster_id, period))) %>%
+    dplyr::left_join(N_i,       by = setNames(cluster_id, cluster_id)) %>%
+    dplyr::mutate(w_iATE = 1, w_cATE = 1/N_i)
+
+  # outcome name
+  y_name <- all.vars(update(formula, . ~ 0))[1]
+
+  # fit model
+  fit <- switch(method,
+                "gee"  = {
+                  fam <- if (family=="gaussian") stats::gaussian() else stats::binomial(link="logit")
+                  f_use <- .strip_re_from_formula(formula) # drop any (1|...)
+                  gee::gee(
+                    formula = f_use,
+                    id      = df[[cluster_id]],     # explicit vector -> no NSE confusion
+                    data    = df,
+                    family  = fam,
+                    corstr  = corstr,
+                    na.action = na.omit
+                  )
+                },
+                "lmer"  = lme4::lmer(formula, data = df),
+                "glmer" = lme4::glmer(formula, data = df, family = stats::binomial(link="logit"))
+  )
+
+  # ---------- UNADJUSTED ----------
+  cp_unadj <- df %>%
+    dplyr::group_by(!!cluster_sym, !!period_sym) %>%
+    dplyr::summarise(
+      Yij      = mean(.data[[y_name]]),
+      Z        = dplyr::first(.data[[trt]]),
+      wij_iATE = sum(w_iATE),
+      wij_cATE = sum(w_cATE),
+      .groups  = "drop"
+    )
+
+  p_w <- cp_unadj %>%
+    dplyr::group_by(!!period_sym) %>%
+    dplyr::summarise(wj_iATE = sum(wij_iATE), wj_cATE = sum(wij_cATE), .groups="drop")
+
+  cp_z <- cp_unadj %>%
+    dplyr::group_by(!!period_sym, Z) %>%
+    dplyr::summarise(
+      num_iATE = sum(wij_iATE*Yij), den_iATE = sum(wij_iATE),
+      num_cATE = sum(wij_cATE*Yij), den_cATE = sum(wij_cATE),
+      .groups="drop"
+    ) %>%
+    dplyr::left_join(p_w, by = setNames(period, period)) %>%
+    dplyr::mutate(
+      Ybar_j_iATE = .sdiv(num_iATE, den_iATE),
+      Ybar_j_cATE = .sdiv(num_cATE, den_cATE)
+    )
+
+  mu_unadj <- cp_z %>%
+    dplyr::group_by(Z) %>%
+    dplyr::summarise(
+      mu_h_iATE_unadj = sum(wj_iATE*Ybar_j_iATE)/sum(wj_iATE),
+      mu_h_cATE_unadj = sum(wj_cATE*Ybar_j_cATE)/sum(wj_cATE),
+      .groups="drop"
+    ) %>% dplyr::arrange(Z)
+
+  if (family=="gaussian") {
+    ATEs_unadj <- mu_unadj %>% dplyr::summarise(`h-iATE` = diff(mu_h_iATE_unadj),
+                                                `h-cATE` = diff(mu_h_cATE_unadj))
+  } else {
+    logit <- function(p) log(p/(1-p))
+    ATEs_unadj <- mu_unadj %>% dplyr::summarise(`h-iATE` = logit(mu_h_iATE_unadj[2]) - logit(mu_h_iATE_unadj[1]),
+                                                `h-cATE` = logit(mu_h_cATE_unadj[2]) - logit(mu_h_cATE_unadj[1]))
+  }
+
+  # ---------- AUGMENTED ----------
+  # We need μ0 and μ1 per CP.
+  if (family == "binomial") {
+    # Individual-level predictions, then average to CP
+    nd0 <- df; nd0[[trt]] <- 0L
+    nd1 <- df; nd1[[trt]] <- 1L
+
+    # if pz* exist, recompute under Z=0/1 at the individual level
+    pz_cols <- grep("^pz\\d+$", names(df), value = TRUE)
+    if (length(pz_cols)) {
+      per_fac <- factor(df[[period]], levels = sort(unique(df[[period]])))
+      per_idx <- as.integer(per_fac); J <- nlevels(per_fac)
+      for (m in seq_len(J)) {
+        nm <- paste0("pz", m)
+        if (nm %in% pz_cols) {
+          nd0[[nm]] <- as.integer(per_idx == m) * 0L
+          nd1[[nm]] <- as.integer(per_idx == m) * 1L
+        }
+      }
+    }
+
+    X0 <- .mm_fixed(fit, nd0, method)
+    X1 <- .mm_fixed(fit, nd1, method)
+    if (method == "gee") {
+      b <- coef(fit)
+      eta0 <- drop(X0 %*% b[colnames(X0)])
+      eta1 <- drop(X1 %*% b[colnames(X1)])
+      mu0_s <- .inv_logit(eta0); mu1_s <- .inv_logit(eta1)
+    } else { # glmer
+      b <- lme4::fixef(fit)
+      eta0 <- drop(X0 %*% b[colnames(X0)])
+      eta1 <- drop(X1 %*% b[colnames(X1)])
+      vc    <- lme4::VarCorr(fit)
+      sigma <- sum(sapply(vc, function(x) attr(x, "stddev")^2))
+      scale <- sqrt((sigma + pi^2/3) / (pi^2/3))
+      mu0_s <- .inv_logit(eta0/scale); mu1_s <- .inv_logit(eta1/scale)
+    }
+
+    data_sum <- df %>%
+      dplyr::mutate(mu0_s = mu0_s, mu1_s = mu1_s) %>%
+      dplyr::group_by(!!cluster_sym, !!period_sym) %>%
+      dplyr::summarise(mu0 = mean(mu0_s), mu1 = mean(mu1_s), .groups="drop")
+
+    cp_pred <- cp_unadj %>%
+      dplyr::left_join(data_sum, by = setNames(c(cluster_id, period), c(cluster_id, period))) %>%
+      dplyr::mutate(m0 = mu0, m1 = mu1)
+
+  } else {
+    # GAUSSIAN: CP-level predictions at CP covariate means
+    cp_proto <- df %>%
+      dplyr::arrange(!!cluster_sym, !!period_sym) %>%
+      dplyr::group_by(!!cluster_sym, !!period_sym) %>% dplyr::slice(1) %>% dplyr::ungroup() %>%
+      dplyr::left_join(p_w, by = setNames(period, period))
+
+    all_used <- all.vars(delete.response(terms(fit)))
+    extras   <- grep("^p\\d+$|^pz\\d+$", names(df), value = TRUE)
+    never_avg <- unique(c(y_name, trt, cluster_id, period, "Nij","N_i"))
+    cand <- setdiff(unique(c(all_used, extras)), never_avg)
+    cand <- intersect(cand, names(df))
+    num_cols <- cand[sapply(df[cand], is.numeric)]
+
+    cp_means <- if (length(num_cols)) {
+      df %>% dplyr::group_by(!!cluster_sym, !!period_sym) %>%
+        dplyr::summarise(dplyr::across(all_of(num_cols), mean), .groups="drop")
+    } else {
+      df %>% dplyr::distinct(!!cluster_sym, !!period_sym)
+    }
+
+    cp_base <- cp_proto %>%
+      dplyr::select(-tidyr::any_of(num_cols)) %>%
+      dplyr::left_join(cp_means, by = setNames(c(cluster_id, period), c(cluster_id, period))) %>%
+      dplyr::left_join(cp_unadj %>% dplyr::select(dplyr::all_of(c(cluster_id, period)), Yij, Z, wij_iATE, wij_cATE),
+                       by = setNames(c(cluster_id, period), c(cluster_id, period)))
+
+    preds  <- .pred_cp_means_cp(fit, method, family, cp_base, trt, period)
+    cp_pred <- cp_base %>% dplyr::mutate(m0 = preds$m0, m1 = preds$m1)
+  }
+
+  cp_long <- cp_pred %>%
+    tidyr::crossing(pot_z = c(0,1)) %>%
+    dplyr::mutate(mz = ifelse(pot_z==0, m0, m1)) %>%
+    tidyr::pivot_longer(cols = c(wij_iATE, wij_cATE),
+                        names_to = "w_scheme_cp", values_to = "w_ij") %>%
+    dplyr::mutate(weight_scheme = ifelse(w_scheme_cp=="wij_iATE","iATE","cATE"),
+                  w_j = ifelse(weight_scheme=="iATE",
+                               p_w$wj_iATE[match(!!period_sym, p_w[[period]])],
+                               p_w$wj_cATE[match(!!period_sym, p_w[[period]])]))
+
+  aug_data <- cp_long %>%
+    dplyr::group_by(!!period_sym, weight_scheme, pot_z) %>%
+    dplyr::summarise(
+      num_term1 = sum(w_ij * (Z==pot_z) * (Yij - mz)),
+      den_term1 = sum(w_ij * (Z==pot_z)),
+      sum_mz    = sum(w_ij * mz),
+      w_j       = dplyr::first(w_j),
+      .groups   = "drop"
+    ) %>%
+    dplyr::mutate(
+      term1 = .sdiv(num_term1, den_term1),
+      term2 = .sdiv(sum_mz, w_j),
+      mu_aug = term1 + term2
+    )
+
+  final_agg <- aug_data %>%
+    dplyr::group_by(weight_scheme, pot_z) %>%
+    dplyr::summarise(numerator = sum(w_j * mu_aug),
+                     denominator = sum(w_j),
+                     mu_aug_overall = numerator/denominator,
+                     .groups="drop")
+
+  mu_aug_table <- final_agg %>%
+    dplyr::select(pot_z, weight_scheme, mu_aug_overall) %>%
+    tidyr::pivot_wider(names_from = weight_scheme, values_from = mu_aug_overall, names_prefix = "mu_") %>%
+    dplyr::arrange(pot_z) %>%
+    dplyr::rename(Z = pot_z)
+
+  if (family=="gaussian") {
+    ATEs_aug <- dplyr::tibble(
+      `h-iATE` = mu_aug_table$mu_iATE[mu_aug_table$Z==1] -
+        mu_aug_table$mu_iATE[mu_aug_table$Z==0],
+      `h-cATE` = mu_aug_table$mu_cATE[mu_aug_table$Z==1] -
+        mu_aug_table$mu_cATE[mu_aug_table$Z==0]
+    )
+  } else {
+    logit <- function(p) log(p/(1-p))
+    ATEs_aug <- dplyr::tibble(
+      `h-iATE` = logit(mu_aug_table$mu_iATE[mu_aug_table$Z==1]) -
+        logit(mu_aug_table$mu_iATE[mu_aug_table$Z==0]),
+      `h-cATE` = logit(mu_aug_table$mu_cATE[mu_aug_table$Z==1]) -
+        logit(mu_aug_table$mu_cATE[mu_aug_table$Z==0])
+    )
+  }
+
+  list(
+    fit          = fit,
+    mu_unadj     = mu_unadj,
+    ATEs_unadj   = ATEs_unadj,
+    mu_aug_table = mu_aug_table,
+    ATEs_aug     = ATEs_aug
+  )
+}
+
+# pull the two ATEs as a numeric named vector on the function's native scale
+.extract_ates_vec <- function(res, which = c("aug","unadj")) {
+  which <- match.arg(which)
+  tab <- if (which == "aug") res$ATEs_aug else res$ATEs_unadj
+  v <- unlist(tab[1, ], use.names = TRUE)
+  names(v) <- c("h-iATE","h-cATE")
+  v
+}
+
+# scalar jackknife variance from replicate vector
+.jk_var_scalar <- function(theta_reps) {
+  I <- length(theta_reps)
+  m <- mean(theta_reps)
+  ((I - 1) / I) * sum((theta_reps - m)^2)
+}
+
+# =======================
+#' Fit MRS-XO and compute jackknife SEs
+#'
+#' @param data data.frame
+#' @param formula analysis formula
+#' @param cluster_id,period,trt column names
+#' @param method \code{"gee"}, \code{"lmer"}, or \code{"glmer"}
+#' @param family \code{"gaussian"} or \code{"binomial"}
+#' @param corstr working correlation for GEE
+#'
+#' @return An object of class \code{"mrs_xo"} containing estimates, SEs, replicates, and metadata.
+#' @export
+#'
+#' @examples
+#' \dontrun{
+#' # continuous
+#' data(dat_c, package = "MRSXO")
+#' fml_c <- y_cont ~ 0 + factor(p) + trt +
+#'   x_c01 + x_c02 + x_b01 + x_cat1_2 + x_cat1_3 + (1|h) + (1|h:p)
+#' fit_c <- MRS_XO_fit(dat_c, fml_c, cluster_id="h", period="p", trt="trt",
+#'                     method="lmer", family="gaussian")
+#' summary(fit_c, level = 0.95)
+#'
+#' # binary (GEE)
+#' data(dat_b, package = "MRSXO")
+#' fml_b <- y_bin ~ 0 + factor(p) + trt + x_c01 + x_c02 + x_b01 + x_cat1_2 + x_cat1_3
+#' fit_b <- MRS_XO_fit(dat_b, fml_b, cluster_id="h", period="p", trt="trt",
+#'                     method="gee", family="binomial", corstr="independence")
+#' summary(fit_b, level = 0.90)
+#' }
+MRS_XO_fit <- function(
+    data,
+    formula,
+    cluster_id = "cluster",
+    period     = "period",
+    trt        = "trt",
+    method  = c("gee","lmer","glmer"),
+    family  = c("gaussian","binomial"),
+    corstr  = "independence"
+){
+  method <- match.arg(method)
+  family <- match.arg(family)
+
+  # full-sample estimates (both unadjusted & augmented)
+  full <- MRS_ATEs(
+    data, formula, cluster_id, period, trt, method, family, corstr
+  )
+  full_aug   <- .extract_ates_vec(full, "aug")
+  full_unadj <- .extract_ates_vec(full, "unadj")
+  full_aug_diff   <- unname(full_aug["h-iATE"]   - full_aug["h-cATE"])
+  full_unadj_diff <- unname(full_unadj["h-iATE"] - full_unadj["h-cATE"])
+
+  # delete-1 cluster jackknife
+  cl_sym <- rlang::sym(cluster_id)
+  cl_ids <- unique(dplyr::pull(data, !!cl_sym))
+  I <- length(cl_ids)
+
+  reps_aug_hi   <- numeric(I)
+  reps_aug_hc   <- numeric(I)
+  reps_aug_diff <- numeric(I)
+  reps_unadj_hi   <- numeric(I)
+  reps_unadj_hc   <- numeric(I)
+  reps_unadj_diff <- numeric(I)
+
+  for (g in seq_len(I)) {
+    d_sub <- dplyr::filter(data, (!!cl_sym) != cl_ids[g])
+    res_g <- MRS_ATEs(
+      data = d_sub, formula = formula,
+      cluster_id = cluster_id, period = period, trt = trt,
+      method = method, family = family, corstr = corstr
+    )
+    v_aug   <- .extract_ates_vec(res_g, "aug")
+    v_unadj <- .extract_ates_vec(res_g, "unadj")
+
+    reps_aug_hi[g]   <- v_aug["h-iATE"]
+    reps_aug_hc[g]   <- v_aug["h-cATE"]
+    reps_aug_diff[g] <- v_aug["h-iATE"] - v_aug["h-cATE"]
+
+    reps_unadj_hi[g]   <- v_unadj["h-iATE"]
+    reps_unadj_hc[g]   <- v_unadj["h-cATE"]
+    reps_unadj_diff[g] <- v_unadj["h-iATE"] - v_unadj["h-cATE"]
+  }
+
+  var_aug_hi   <- .jk_var_scalar(reps_aug_hi)
+  var_aug_hc   <- .jk_var_scalar(reps_aug_hc)
+  var_aug_diff <- .jk_var_scalar(reps_aug_diff)
+  var_unadj_hi   <- .jk_var_scalar(reps_unadj_hi)
+  var_unadj_hc   <- .jk_var_scalar(reps_unadj_hc)
+  var_unadj_diff <- .jk_var_scalar(reps_unadj_diff)
+
+  estimates <- dplyr::tibble(
+    method_type     = c("unadjusted","adjusted"),
+    `h-iATE`        = c(full_unadj["h-iATE"], full_aug["h-iATE"]),
+    `h-cATE`        = c(full_unadj["h-cATE"], full_aug["h-cATE"]),
+    `diff`          = c(full_unadj_diff,       full_aug_diff)
+  )
+
+  jk_se <- dplyr::tibble(
+    method_type     = c("unadjusted","adjusted"),
+    `SE(h-iATE)`    = c(sqrt(var_unadj_hi),   sqrt(var_aug_hi)),
+    `SE(h-cATE)`    = c(sqrt(var_unadj_hc),   sqrt(var_aug_hc)),
+    `SE(diff)`      = c(sqrt(var_unadj_diff), sqrt(var_aug_diff))
+  )
+
+  # metadata for summary()
+  meta <- list(
+    call    = match.call(),
+    formula = formula,
+    method  = method,
+    family  = family,
+    corstr  = if (method=="gee") corstr else NA_character_,
+    n_clusters = I,
+    n_periods  = length(unique(data[[period]])),
+    n_subjects = nrow(data),
+    cluster_id = cluster_id,
+    period     = period,
+    trt        = trt
+  )
+
+  res <- list(estimates = estimates, jk_se = jk_se, reps = full, meta = meta)
+  class(res) <- "mrs_xo"
+  res
+}
+
+#' Summarize an mrs_xo fit
+#'
+#' @param object an \code{mrs_xo} object
+#' @param level confidence level for CIs (default 0.95)
+#' @param ... unused
+#'
+#' @return Invisibly returns a list with the printed tables.
+#' @export
+#' @method summary mrs_xo
+#'
+#' @examples
+#' \dontrun{
+#' data(dat_c, package = "MRSXO")
+#' fml_c <- y_cont ~ 0 + factor(p) + trt +
+#'   x_c01 + x_c02 + x_b01 + x_cat1_2 + x_cat1_3 + (1|h) + (1|h:p)
+#' fit_c <- MRS_XO_fit(dat_c, fml_c, cluster_id="h", period="p", trt="trt",
+#'                     method="lmer", family="gaussian")
+#' summary(fit_c, level = 0.9)
+#' }
+summary.mrs_xo <- function(object, level = 0.95, ...) {
+  stopifnot(inherits(object, "mrs_xo"))
+  est <- object$estimates
+  se  <- object$jk_se
+  meta <- object$meta
+
+  df <- max(1, meta$n_clusters - 1L)
+  alpha <- 1 - level
+  crit  <- stats::qt(1 - alpha/2, df = df)
+
+  # merge est + se + CI
+  add_ci <- function(val, se) {
+    lo <- val - crit * se
+    hi <- val + crit * se
+    cbind(Estimate = val, SE = se, LCL = lo, UCL = hi)
+  }
+  # build per-parameter frames
+  tab_hi   <- as.data.frame(add_ci(est$`h-iATE`, se$`SE(h-iATE)`))
+  tab_hc   <- as.data.frame(add_ci(est$`h-cATE`, se$`SE(h-cATE)`))
+  tab_diff <- as.data.frame(add_ci(est$`diff`,   se$`SE(diff)`))
+  rownames(tab_hi) <- rownames(tab_hc) <- rownames(tab_diff) <- est$method_type
+
+  # print meta + results
+  cat("\nMRS-XO Summary\n")
+  cat(rep("=", 72), "\n", sep = "")
+  cat(sprintf("Method:       %s   (family: %s)\n", meta$method, meta$family))
+  if (!is.na(meta$corstr)) cat(sprintf("GEE corstr:   %s\n", meta$corstr))
+  cat(sprintf("Clusters:     %d    Periods: %d    N: %d\n",
+              meta$n_clusters, meta$n_periods, meta$n_subjects))
+  cat(sprintf("Cluster id:   %s    Period: %s     Trt: %s\n",
+              meta$cluster_id, meta$period, meta$trt))
+  cat("Formula:      "); print(meta$formula)
+  cat(sprintf("CIs: %.1f%% (t, df = %d)\n\n", 100*level, df))
+
+  cat("i-ATE (hospital-weighted individual ATE)\n")
+  print(round(tab_hi, 6))
+  cat("\n")
+  cat("c-ATE (hospital-weighted cluster ATE)\n")
+  print(round(tab_hc, 6))
+  cat("\n")
+  cat("Difference (i-ATE minus c-ATE)\n")
+  print(round(tab_diff, 6))
+  cat("\n")
+
+  invisible(list(iATE = tab_hi, cATE = tab_hc, diff = tab_diff, meta = meta, level = level))
+}
+
