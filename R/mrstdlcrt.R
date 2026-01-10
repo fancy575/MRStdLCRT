@@ -123,19 +123,30 @@ mrs_fit_working_model <- function(data_fit, formula, cluster_id, method, family,
   if (method == "gee") {
     fam <- if (family == "gaussian") stats::gaussian() else stats::binomial(link = "logit")
     f_use <- mrs_strip_re_from_formula(formula)
+
     fit <- NULL
     utils::capture.output({
-      fit <- gee::gee(
+      fit <- suppressWarnings(gee::gee(
         formula   = f_use,
         id        = data_fit[[cluster_id]],
         data      = data_fit,
         family    = fam,
         corstr    = corstr,
         na.action = stats::na.omit
-      )
+      ))
     }, type = "output")
+
+    # IMPORTANT: store the evaluated formula (avoid symbol-only call storage)
+    fit$formula <- f_use
+    fit$call$formula <- f_use
+
+    # Optional but helpful for factors in newdata
+    mf_train <- stats::model.frame(f_use, data = data_fit, na.action = stats::na.omit)
+    fit$xlevels <- attr(mf_train, "xlevels")
+
     return(fit)
   }
+
 
   if (method == "lmer")  return(lme4::lmer(formula, data = data_fit))
   if (method == "glmer") return(lme4::glmer(formula, data = data_fit,
@@ -160,7 +171,7 @@ mrs_predict_mean <- function(fit, newdata, method, family) {
 
   if (inherits(fit, "merMod")) {
     # fixed-effect formula
-    f_fix <- lme4::nobars(stats::formula(fit))
+    f_fix <- reformulas::nobars(stats::formula(fit))
     TT <- stats::terms(f_fix, data = newdata)
 
     # factor levels as in training
@@ -192,8 +203,17 @@ mrs_predict_mean <- function(fit, newdata, method, family) {
 
   if (method == "gee") {
     fml <- fit$formula
+    if (is.null(fml)) fml <- fit$call$formula
+
+    # If still a symbol/name, we cannot safely recover it later; require stored formula
+    if (is.symbol(fml) || is.name(fml)) {
+      stop("GEE fit contains only a symbolic formula reference. Store the evaluated formula in fit$formula when fitting.")
+    }
+
+    fml <- stats::as.formula(fml)
+
     TT  <- stats::delete.response(stats::terms(fml, data = newdata))
-    mf  <- stats::model.frame(TT, data = newdata, na.action = stats::na.pass)
+    mf  <- stats::model.frame(TT, data = newdata, xlev = fit$xlevels, na.action = stats::na.pass)
     X   <- stats::model.matrix(TT, mf)
 
     b <- stats::coef(fit)
@@ -204,6 +224,9 @@ mrs_predict_mean <- function(fit, newdata, method, family) {
     if (family == "gaussian") return(eta)
     return(mrs_inv_logit(eta))
   }
+
+
+
 
   stop("Unknown fit class/method.")
 }
