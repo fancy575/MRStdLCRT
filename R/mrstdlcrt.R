@@ -278,14 +278,15 @@ mrs_mu_period_tables <- function(cp_k, period, w_col, omega_col) {
     dplyr::group_by(!!per_sym, .data$pot_z) |>
     dplyr::summarise(
       sum_w_mz = sum(!!w_sym * .data$mz),
+      den_mz   = sum(!!w_sym),  # <-- NEW: within-period sum of weights
       num_t1   = sum(!!w_sym * (.data$Zij == .data$pot_z) * (.data$Ybar_ij - .data$mz)),
       den_t1   = sum(!!w_sym * (.data$Zij == .data$pot_z)),
-      omega    = dplyr::first(!!om_sym),
+      omega    = dplyr::first(!!om_sym),  # keep for later aggregation only
       .groups  = "drop"
     ) |>
     dplyr::mutate(
       term1  = mrs_sdiv(.data$num_t1, .data$den_t1),
-      term2  = mrs_sdiv(.data$sum_w_mz, .data$omega),
+      term2  = mrs_sdiv(.data$sum_w_mz, .data$den_mz),  # <-- FIX (not omega)
       mu_aug = .data$term1 + .data$term2
     ) |>
     dplyr::rename(Z = .data$pot_z) |>
@@ -293,6 +294,7 @@ mrs_mu_period_tables <- function(cp_k, period, w_col, omega_col) {
 
   list(mu_unadj_jz = mu_unadj_jz, mu_aug_jz = mu_aug_jz)
 }
+
 
 mrs_aggregate_mu <- function(mu_jz, omega_j, period, omega_col) {
   per_sym <- rlang::sym(period)
