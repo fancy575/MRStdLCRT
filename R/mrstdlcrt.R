@@ -807,7 +807,8 @@ print.mrs <- function(x, ...) {
 #' @param ics_method Which estimator covariance to use for the ICS test:
 #'   \code{"both"} (default), \code{"unadjusted"}, or \code{"adjusted"}.
 #' @param ics_tol Numerical tolerance for rank determination and generalized inverse.
-#' @param ... Unused.
+#' @param ... Unused. (For backwards compatibility, \code{method_type=} is accepted as an
+#'   alias for \code{ics_method=} when passed via \code{...}.)
 #' @return Invisibly returns a list containing printed tables, metadata, and (if requested)
 #'   ICS test results.
 #' @export
@@ -821,6 +822,17 @@ summary.mrs <- function(object,
                         ics_tol = 1e-10,
                         ...) {
   stopifnot(inherits(object, "mrs"))
+
+  dots <- list(...)
+
+  # Back-compat / user convenience: allow method_type="adjusted" as alias for ics_method
+  if (!is.null(dots$method_type) && is.null(dots$ics_method)) {
+    ics_method <- dots$method_type
+  }
+  # Also accept ics_method passed via ...
+  if (!is.null(dots$ics_method)) {
+    ics_method <- dots$ics_method
+  }
 
   est  <- object$estimates
   se   <- object$jk_se
@@ -878,7 +890,7 @@ summary.mrs <- function(object,
   }
 
   # =============================================================================
-  # ICS test helpers (self-contained; no external deps)
+  # ICS test helpers
   # =============================================================================
 
   C_global <- function() {
@@ -1017,7 +1029,7 @@ summary.mrs <- function(object,
     }
 
     cat("ICS hypothesis test (linear-contrast F test)\n")
-    cat(rep("-", 72), "\n", sep = "")
+    cat(rep("-", 50), "\n", sep = "")
     cat("Contrasts (rows of C):\n")
     print(C)
     cat("\n")
@@ -1036,7 +1048,12 @@ summary.mrs <- function(object,
       )
     }))
 
-    print(round(out_tab, digits))
+    # round numeric columns only (avoid round() error on method_type/note)
+    out_tab_print <- out_tab
+    num_cols <- vapply(out_tab_print, is.numeric, logical(1))
+    out_tab_print[num_cols] <- lapply(out_tab_print[num_cols], round, digits = digits)
+
+    print(out_tab_print)
     cat("\n")
 
     ics_results <- list(C = C, table = out_tab, tests = tests)
@@ -1098,6 +1115,7 @@ summary.mrs <- function(object,
     tables = printed
   ))
 }
+
 
 
 #' Plot method for mrs objects

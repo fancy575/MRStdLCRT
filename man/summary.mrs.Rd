@@ -39,7 +39,8 @@ or a numeric contrast matrix \code{C}.}
 
 \item{ics_tol}{Numerical tolerance for rank determination and generalized inverse.}
 
-\item{...}{Unused.}
+\item{...}{Unused. (For backwards compatibility, \code{method_type=} is accepted as an
+alias for \code{ics_method=} when passed via \code{...}.)}
 }
 \value{
 Invisibly returns a list containing printed tables, metadata, and (if requested)
