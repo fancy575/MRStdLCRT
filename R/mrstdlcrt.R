@@ -869,7 +869,7 @@ summary.mrs <- function(object,
 
   if (!is.null(reps$period_mix_table) && nrow(reps$period_mix_table)) {
     cat("Period mixture table (min/max of Z_ij by period)\n")
-    cat(rep("-", 72), "\n", sep = "")
+    cat(rep("-", 50), "\n", sep = "")
     print(reps$period_mix_table)
     cat("\n")
   }
@@ -877,13 +877,13 @@ summary.mrs <- function(object,
   if (isTRUE(show_counts) && !is.null(reps$counts)) {
     if (!is.null(reps$counts$period) && nrow(reps$counts$period)) {
       cat("Counts used in aggregation (kept periods only)\n")
-      cat(rep("-", 72), "\n", sep = "")
+      cat(rep("-", 50), "\n", sep = "")
       print(reps$counts$period)
       cat("\n")
     }
     if (!is.null(reps$counts$cluster) && nrow(reps$counts$cluster)) {
       cat("Per-cluster counts (kept periods only)\n")
-      cat(rep("-", 72), "\n", sep = "")
+      cat(rep("-", 50), "\n", sep = "")
       print(reps$counts$cluster)
       cat("\n")
     }
