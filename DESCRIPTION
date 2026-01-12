@@ -33,7 +33,8 @@ Imports:
     lme4 (>= 1.1-30),
     ggplot2 (>= 3.4.0),
     stats,
-    utils
+    utils,
+    MASS
 Suggests:
     testthat (>= 3.0.0)
 Config/testthat/edition: 3

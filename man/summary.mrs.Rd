@@ -10,25 +10,43 @@
   estimand = NULL,
   digits = 6,
   show_counts = TRUE,
+  ics = "global",
+  ics_method = c("both", "unadjusted", "adjusted"),
+  ics_tol = 1e-10,
   ...
 )
 }
 \arguments{
 \item{object}{An object of class \code{"mrs"}.}
 
-\item{level}{Confidence level.}
+\item{level}{Confidence level for Wald-type confidence intervals.}
 
-\item{estimand}{Optional subset of estimands.}
+\item{estimand}{Optional subset of estimands to print; any of
+\code{c("h-iATE","h-cATE","v-iATE","v-cATE")}. Default prints all.}
 
 \item{digits}{Digits to print.}
 
-\item{show_counts}{Print counts tables.}
+\item{show_counts}{Logical; if \code{TRUE}, prints counts tables used in aggregation.}
+
+\item{ics}{ICS test specification. Default \code{"global"} performs the global test of
+equality across all four estimands using a 3x4 contrast matrix. Use \code{"none"} (or
+\code{FALSE}) to disable. You may also pass a character vector of estimands (length >= 2),
+a list (e.g., \code{list(equal=...)}, \code{list(pairs=...)}, or \code{list(C=...)}),
+or a numeric contrast matrix \code{C}.}
+
+\item{ics_method}{Which estimator covariance to use for the ICS test:
+\code{"both"} (default), \code{"unadjusted"}, or \code{"adjusted"}.}
+
+\item{ics_tol}{Numerical tolerance for rank determination and generalized inverse.}
 
 \item{...}{Unused.}
 }
 \value{
-Invisibly returns a list of printed tables and metadata.
+Invisibly returns a list containing printed tables, metadata, and (if requested)
+ICS test results.
 }
 \description{
-Summarize an mrs fit
+Prints mixture diagnostics, optional aggregation counts, per-estimand estimates/SE/CIs,
+and (optionally) an informative cluster/period/cluster-period size (ICS) linear-contrast
+F-test based on the jackknife covariance.
 }
